@@ -135,6 +135,9 @@ def _make_session_manager(user_id: str, job_id: int):
             retrieval_config = {
                 "/preferences/{actorId}": RetrievalConfig(top_k=5,  relevance_score=0.6),
                 "/facts/{actorId}":       RetrievalConfig(top_k=10, relevance_score=0.3),
+                # 리포트 Lambda(별도)가 재생성 이력을 종합해 쓰는 고차 인사이트.
+                # 아직 아무도 안 쓰면 조회 결과가 항상 빈 배열이라 안전(에러 없음).
+                "/insights/{actorId}":    RetrievalConfig(top_k=3,  relevance_score=0.5),
             },
         ),
         region_name=REGION,
@@ -204,6 +207,10 @@ def handler(payload, context):
         # 결정적 도구 4개를 병렬 사전조회해 주입 → LLM이 STEP 1~2를 도구로 돌 필요 없음
         prefetched = _prefetch_tool_data(user_id, diary_ids, ctx["crop_name"])
 
+        # STEP 3-1(비율 규칙)을 코드로 미리 계산해 후보만 LLM에 전달
+        # → 프롬프트는 STEP 3-2/3-3(Memory·트렌드 해석)에만 집중
+        angle_decision = _decide_angle_candidates(platform.lower(), prefetched.get("contentHistory") or {})
+
         agent_input = json.dumps({
             "userId":        user_id,
             "platform":      platform.lower(),
@@ -214,6 +221,7 @@ def handler(payload, context):
             "diaryIds":      diary_ids,
             "keywords":      keywords,
             "prefetched":    prefetched,
+            "angleDecision": angle_decision,
         }, ensure_ascii=False)
 
         response = agent(agent_input)
@@ -377,6 +385,68 @@ def _prefetch_tool_data(user_id: str, diary_ids: list, crop_name: str) -> dict:
                 "contentHistory": _load(f_history),
                 "trend":          _load(f_trend),
             }
+
+
+# 각도 문자열 → 콘텐츠 유형 (prompts/angles/*.txt 첫 줄과 동기화)
+_ANGLE_TYPE_MAP = {
+    "레시피":     "정보형", "보관법": "정보형", "영양": "정보형", "제철 강조": "정보형",
+    "수확 현장":  "공감형", "스토리텔링": "공감형",
+    "지역 강조":  "신뢰형",
+    "구매 유도":  "판매형",
+}
+_TYPE_ANGLES = {
+    "정보형": ["레시피", "보관법", "영양", "제철 강조"],
+    "공감형": ["수확 현장", "스토리텔링"],
+    "신뢰형": ["지역 강조"],
+    "판매형": ["구매 유도"],
+}
+
+
+# 콘텐츠 유형별 목표 비율 — 정보형40 / 공감형30 / 신뢰형20 / 판매형10
+_TARGET_RATIO = {"정보형": 0.40, "공감형": 0.30, "신뢰형": 0.20, "판매형": 0.10}
+
+
+def _decide_angle_candidates(platform: str, content_history: dict) -> dict:
+    """usedAngles 목표 비율(STEP 3-1)을 결정론적으로 계산해 후보를 좁힌다.
+    STEP 3-2(Memory 선호도)·3-3(트렌드)의 의미적 판단은 LLM에 그대로 남긴다
+    — 자연어 해석이 필요한 부분까지 코드로 옮기면 억지 결정론이 되므로 제외.
+
+    절대건수 임계값(정보형<4 등) 대신 목표비율 대비 부족분(deficit)을 계산한다.
+    절대건수는 이력이 쌓일수록 조건이 항상 거짓이 되어 규칙이 무력화되지만,
+    비율은 이력 규모와 무관하게 항상 유효하게 목표를 유지한다.
+    """
+    if platform == "smartstore":
+        return {"fixedAngle": "smartstore_detail", "candidates": [], "excludeSale": False}
+
+    history = content_history.get("history") or [] if isinstance(content_history, dict) else []
+    total = len(history)
+
+    type_counts = {"정보형": 0, "공감형": 0, "신뢰형": 0, "판매형": 0}
+    for h in history:
+        t = _ANGLE_TYPE_MAP.get(h.get("angle", ""))
+        if t:
+            type_counts[t] += 1
+
+    # 판매형 연속 2회는 비율과 별개의 하드 규칙(반복 스팸 방지)
+    recent_two = [h.get("angle", "") for h in history[:2]]
+    exclude_sale = len(recent_two) >= 2 and all(_ANGLE_TYPE_MAP.get(a) == "판매형" for a in recent_two)
+
+    # 목표비율 대비 부족분이 큰(목표에 못 미치는) 유형부터 후보로 제시.
+    # 이력 0건(신규 유저)이어도 division-by-zero 없이 목표비율이 큰 순으로 자연스럽게 정렬됨.
+    deficits = []
+    for t, target in _TARGET_RATIO.items():
+        if t == "판매형" and exclude_sale:
+            continue
+        actual = (type_counts[t] / total) if total else 0.0
+        deficits.append((target - actual, t))
+    deficits.sort(key=lambda x: -x[0])
+
+    candidates = [
+        {"contentType": t, "angles": _TYPE_ANGLES[t], "targetRatio": _TARGET_RATIO[t], "deficit": round(d, 3)}
+        for d, t in deficits
+    ]
+
+    return {"fixedAngle": None, "candidates": candidates, "excludeSale": exclude_sale}
 
 
 def _update_job(job_id: int, status: str, pct: int):
