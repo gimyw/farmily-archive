@@ -307,9 +307,9 @@ def get_content_history(user_id: str, crop_name: str, limit: int = 10) -> str:
 @tool
 def search_trend(crop_name: str, query: str = "") -> str:
     """
-    최근 7일간 수집된 트렌드 리포트를 벡터 유사도로 검색합니다.
-    네이버 DataLab 검색량, YouTube 트렌딩, 만개의레시피 기반 Claude 요약 결과를 반환합니다.
-    반환 필드: query, count, reports[]{date, source, content, similarity}
+    최근 7일간 수집된 트렌드 신호 조각을 하이브리드(문자매칭+벡터) 검색합니다.
+    네이버 DataLab 검색량, YouTube 트렌딩, 만개의레시피에서 추출한 개별 신호(작물/키워드 태그 포함)를 반환합니다.
+    반환 필드: query, count, reports[]{date, source, content, crops, keywords, change_pct, similarity, kw_score, vec_score}
     """
     if not query:
         query = crop_name + " 트렌드"
@@ -324,15 +324,20 @@ def search_trend(crop_name: str, query: str = "") -> str:
 
         with get_connection() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # 하이브리드: pg_trgm 문자매칭(직접 언급) + 코사인 벡터(의미 연관) 가중합.
+                # WHERE embedding IS NOT NULL이 프로즈 요약(source='summary', embedding=NULL)을
+                # 자동 배제하고 신호 조각(source='signal')만 잡는다 — 별도 source 필터 불필요.
+                # 가중치 0.5/0.5는 시작값 (docs/trend-search-chunk-hybrid-plan.md 5·7장 참고, 검증 후 튜닝).
                 cur.execute("""
-                    SELECT report_date, source, content,
-                           1 - (embedding <=> %s::vector) AS similarity
+                    SELECT report_date, source, content, crops, keywords, change_pct,
+                           similarity(content, %s)          AS kw_score,
+                           1 - (embedding <=> %s::vector)   AS vec_score
                     FROM trend_reports
                     WHERE report_date >= CURRENT_DATE - INTERVAL '7 days'
                       AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT 3
-                """, (v_str, v_str))
+                    ORDER BY (0.5 * similarity(content, %s) + 0.5 * (1 - (embedding <=> %s::vector))) DESC
+                    LIMIT 8
+                """, (crop_name, v_str, crop_name, v_str))
                 rows = cur.fetchall()
 
         return json.dumps({
@@ -343,7 +348,12 @@ def search_trend(crop_name: str, query: str = "") -> str:
                     "date":       str(r["report_date"]),
                     "source":     r["source"],
                     "content":    r["content"],
-                    "similarity": float(r["similarity"]),
+                    "crops":      r["crops"] or [],
+                    "keywords":   r["keywords"] or [],
+                    "change_pct": float(r["change_pct"]) if r["change_pct"] is not None else None,
+                    "similarity": float(0.5 * r["kw_score"] + 0.5 * r["vec_score"]),
+                    "kw_score":   float(r["kw_score"]),
+                    "vec_score":  float(r["vec_score"]),
                 }
                 for r in rows
             ],
