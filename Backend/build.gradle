@@ -1,0 +1,105 @@
+plugins {
+	id 'java'
+	id 'org.springframework.boot' version '4.0.6'
+	id 'io.spring.dependency-management' version '1.1.7'
+	id 'org.sonarqube' version '7.3.0.8198'
+}
+
+// SonarCloud(SonarQube Cloud) 정적분석 설정 — CI의 ./gradlew sonar 가 사용
+sonar {
+	properties {
+		property 'sonar.projectKey', 'urbanworkteam_Backend'
+		property 'sonar.organization', 'urbanworkteam'
+	}
+}
+
+group = 'kr.farmily'
+version = '0.0.1-SNAPSHOT'
+description = 'Farmily Backend API'
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(21)
+	}
+}
+
+repositories {
+	mavenCentral()
+}
+
+ext {
+	mapstructVersion = '1.6.3'
+	jjwtVersion = '0.12.6'
+	springdocVersion = '2.7.0'
+	awsSdkVersion = '2.30.0'
+	lombokVersion = '1.18.46'
+	hypersistenceUtilsVersion = '3.15.2'
+}
+
+dependencyManagement {
+	imports {
+		mavenBom "software.amazon.awssdk:bom:${awsSdkVersion}"
+	}
+}
+
+dependencies {
+	// Spring Boot starters
+	implementation 'org.springframework.boot:spring-boot-starter-actuator'
+	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+	implementation 'org.springframework.boot:spring-boot-starter-flyway'
+	implementation 'org.springframework.boot:spring-boot-starter-security'
+	implementation 'org.springframework.boot:spring-boot-starter-validation'
+	implementation 'org.springframework.boot:spring-boot-starter-webmvc'
+	implementation 'org.springframework.boot:spring-boot-starter-webflux' // WebClient for KMA/Kakao REST
+	implementation 'org.springframework.boot:spring-boot-starter-json'    // ObjectMapper / Jackson auto-config
+	implementation 'org.springframework.boot:spring-boot-starter-data-redis' // ElastiCache 핫 read 캐시 (Lettuce)
+	implementation 'org.springframework.boot:spring-boot-starter-cache'      // @Cacheable / @CacheEvict 추상화
+
+	// DB
+	implementation 'org.flywaydb:flyway-database-postgresql'
+	runtimeOnly 'org.postgresql:postgresql'
+
+	// JWT
+	implementation "io.jsonwebtoken:jjwt-api:${jjwtVersion}"
+	runtimeOnly "io.jsonwebtoken:jjwt-impl:${jjwtVersion}"
+	runtimeOnly "io.jsonwebtoken:jjwt-jackson:${jjwtVersion}"
+
+	// OpenAPI / Swagger
+	implementation "org.springdoc:springdoc-openapi-starter-webmvc-ui:${springdocVersion}"
+
+	// MapStruct (DTO 매핑)
+	implementation "org.mapstruct:mapstruct:${mapstructVersion}"
+	annotationProcessor "org.mapstruct:mapstruct-processor:${mapstructVersion}"
+
+	// AWS SDK (S3 presign, Bedrock Agent)
+	implementation 'software.amazon.awssdk:s3'
+	implementation 'software.amazon.awssdk:bedrockagentruntime'
+	// IRSA(EKS)는 웹 아이덴티티 토큰을 STS로 교환해 자격증명을 얻으므로 sts 모듈 필수
+	// (ECS 컨테이너 자격증명 방식에선 불필요했어서 누락돼 있었음)
+	implementation 'software.amazon.awssdk:sts'
+
+	// Firebase Admin (FCM)
+	implementation 'com.google.firebase:firebase-admin:9.4.3'
+
+	// JSON-B (jsonb 컬럼 매핑용) — Hibernate 7.x 네이티브 @JdbcTypeCode(SqlTypes.JSON/ARRAY) 사용 (hypersistence-utils 제거)
+
+	// Lombok — Java 21 호환 버전 명시 고정
+	compileOnly "org.projectlombok:lombok:${lombokVersion}"
+	annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+
+	// Test
+	testImplementation 'org.springframework.boot:spring-boot-starter-actuator-test'
+	testImplementation 'org.springframework.boot:spring-boot-starter-data-jpa-test'
+	testImplementation 'org.springframework.boot:spring-boot-starter-flyway-test'
+	testImplementation 'org.springframework.boot:spring-boot-starter-security-test'
+	testImplementation 'org.springframework.boot:spring-boot-starter-validation-test'
+	testImplementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
+	testCompileOnly "org.projectlombok:lombok:${lombokVersion}"
+	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+	testAnnotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+	testAnnotationProcessor "org.mapstruct:mapstruct-processor:${mapstructVersion}"
+}
+
+tasks.named('test') {
+	useJUnitPlatform()
+}

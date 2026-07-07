@@ -1,0 +1,369 @@
+# Backend CI/CD — Phase 1(ci + ECR push) + Phase 2(ECS 자동배포) 완성
+# feat push → farmily-api-dev ECR / main push → farmily-api ECR → ECS prod 자동배포
+# 이미지 태그: {env}-{short-sha} (latest 단독 배포 금지)
+#
+# Jobs:
+#   ci          : gradle test + SonarCloud (PR·push 공통)
+#   push-image  : Buildx build(gha 레이어 캐시) → ECR push (push 이벤트만)
+#   deploy-prod : ECS RegisterTaskDef + UpdateService + wait (main push만)
+#   gitops-update-dev : Infra values-dev.yaml 태그 bump → 직접 push (feat push만, ArgoCD가 pull)
+#
+# 전제: AWS_ROLE_ARN(farmily-cicd-backend-role), SONAR_TOKEN 등록 완료.
+
+name: Backend CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [feat, main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+
+jobs:
+  # ─── Job 1: CI (테스트 + 정적분석) ─── PR·push 공통
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # SonarCloud new-code 분석 위해 전체 히스토리
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Unit Test
+        run: chmod +x gradlew && ./gradlew test
+
+      - name: SonarCloud Analyze
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: ./gradlew sonar
+
+      - name: Notify Slack (CI failure)
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {"text": "❌ CI 실패 — Backend / `${{ github.ref_name }}` | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|로그 보기>"}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ─── Job 2: 이미지 빌드 + ECR Push ─── feat push만 (build-once)
+  # build-once: 이미지는 dev(feat)에서 1번만 빌드. prod는 gitops-update-prod가
+  # 같은 이미지를 crane copy로 승격(재빌드 X). main push는 빌드 안 함.
+  push-image:
+    needs: ci
+    if: github.ref_name == 'feat'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}   # 전체 이미지 URI(farmily-api-dev:dev-<sha>)
+      tag: ${{ steps.meta.outputs.tag }}       # 순수 태그(dev-<sha>) — gitops-update-dev용
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419  # v2.1.5
+
+      # dev 이미지 메타데이터(feat 전용이라 분기 불필요)
+      - name: Set image metadata (repo, tag)
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/farmily-api-dev"
+          TAG="dev-${GITHUB_SHA::7}"
+          {
+            echo "image=$IMAGE:$TAG"
+            echo "tag=$TAG"          # gitops-update-dev용 순수 태그
+            echo "tags=$IMAGE:$TAG"  # build-push-action용(단일 태그 — latest 없음)
+          } >> "$GITHUB_OUTPUT"
+
+      # BuildKit 활성화 — gha 레이어 캐시(cache-from/to) 사용에 필수
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      # A: GitHub Actions 캐시로 빌드 레이어 재사용
+      #   - Gradle 배포본/의존성 레이어가 캐시되어 매 빌드 재다운로드 제거(빌드 단축 + 504 회피)
+      #   - cache-to mode=max: 중간 레이어까지 캐시 / type=gha: 무료 10GB GitHub 호스팅 캐시
+      - name: Build & Push image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: infra/docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─── Job 3: GitOps 이미지 승격 (prod) ─── main push만 (build-once)
+  # ECS deploy-prod 대체 — prod는 ALB weight 100% EKS라 ECS 잡 제거.
+  # build-once: dev(feat)에서 빌드된 farmily-api-dev:dev-<sha>를 crane copy로 prod 리포 승격
+  # (재빌드 X·동일 digest) → values-prod.yaml 태그 PR(사람 머지 게이트) → ArgoCD가 prod-eks 반영.
+  # dev=직접커밋(즉시) / prod=PR. ECS deploy-prod 원본 코드는 블로그 ECS-4편에 보존.
+  gitops-update-prod:
+    needs: ci
+    if: github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    outputs:
+      src_sha: ${{ steps.src.outputs.src_sha }}
+      promoted: ${{ steps.check.outputs.exists }}
+    permissions:
+      id-token: write      # crane copy용 OIDC 토큰 발급(configure-aws-credentials) — 필수
+      contents: read       # checkout(GITHUB_TOKEN). Infra push는 App 토큰 별도
+    steps:
+      - name: Checkout Backend (머지 부모 접근용)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # HEAD^1(머지 전 main)·HEAD^2(머지된 feat tip) 접근
+
+      # 승격할 dev 이미지의 SHA 복구 + 앱 변경 여부 판정
+      - name: Resolve source SHA & app-change
+        id: src
+        run: |
+          # 머지 커밋이면 2nd parent(=dev 이미지를 빌드한 feat tip), 아니면 HEAD(FF/직접)
+          SRC_SHA=$(git rev-parse --short=7 HEAD^2 2>/dev/null || git rev-parse --short=7 HEAD)
+          # 앱 코드 변경 있나(없으면 ci/docs 머지 → prod 승격 대상 아님)
+          if git diff --name-only HEAD^1 HEAD | grep -qE '^(src/|build\.gradle|settings\.gradle|gradle/|infra/docker/)'; then
+            APP_CHANGED=true
+          else
+            APP_CHANGED=false
+          fi
+          echo "src_sha=$SRC_SHA"          >> "$GITHUB_OUTPUT"
+          echo "app_changed=$APP_CHANGED"  >> "$GITHUB_OUTPUT"
+          echo "SRC_SHA=$SRC_SHA APP_CHANGED=$APP_CHANGED"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}   # farmily-cicd-backend-role (farmily-api* 와일드카드로 양 리포 커버)
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419  # v2.1.5
+
+      # 결정 C: dev 이미지 없으면 승격 skip (조용히/시끄럽게는 app_changed로 분기)
+      - name: Check dev image exists
+        id: check
+        env:
+          SRC_SHA: ${{ steps.src.outputs.src_sha }}   # 셸 직접 보간 금지(인젝션 방지) → env 경유
+        run: |
+          # describe-images 실패를 "이미지 없음"과 "그 외 오류"로 구분한다.
+          # 옛 코드는 >/dev/null 2>&1로 모든 비정상 종료를 exists=false 처리 → describe-images가 순간 실패
+          # (throttling·권한·네트워크·ECR 장애)해도 "dev 이미지 없음"으로 오판 → prod 승격을 조용히 skip(사고 원인).
+          # → ImageNotFoundException만 false, 그 외 오류는 step을 실패시켜(재실행 유도) 오판 차단.
+          #
+          # ⚠️ 타이밍 경쟁: dev 이미지는 feat의 push-image 잡이 만든다. 머지가 그 빌드보다 빠르면
+          # 이 main 잡이 돌 때 dev-<sha>가 아직 ECR에 없어 ImageNotFound → 승격 누락(2026-06-26 사고).
+          # → ImageNotFound면 즉시 포기하지 말고 최대 ~8분(빌드 소요 ~5분 + 여유) 폴링해 빌드 완료를 흡수한다.
+          #   끝까지 없으면(feat 우회 / 빌드 실패) exists=false → 아래 단계에서 Slack 알림(진짜 누락).
+          MAX=32; SLEEP=15   # 32 × 15s = 8분
+          for i in $(seq 1 "$MAX"); do
+            set +e
+            ERR=$(aws ecr describe-images --repository-name farmily-api-dev \
+                    --image-ids imageTag="dev-$SRC_SHA" \
+                    --region "$AWS_REGION" 2>&1 >/dev/null)
+            RC=$?
+            set -e
+            if [ "$RC" -eq 0 ]; then
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "✅ dev-$SRC_SHA 발견 (시도 $i/$MAX)"
+              exit 0
+            elif printf '%s' "$ERR" | grep -q "ImageNotFoundException"; then
+              echo "⏳ dev-$SRC_SHA 아직 없음 — feat 빌드(push-image) 대기 ($i/$MAX)"
+              sleep "$SLEEP"
+            else
+              echo "::error::ECR describe-images 실패(이미지 없음 아님, 재실행 필요): $ERR"
+              exit 1
+            fi
+          done
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+          echo "⚠️ dev-$SRC_SHA 8분 대기 후에도 없음 → 승격 skip (feat 우회 or 빌드 실패 의심)"
+
+      # 계층화 skip ① 앱 변경인데 dev 이미지 없음 = 진짜 배포 누락 → ⚠️ Slack
+      - name: Notify skip (app changed, image missing)
+        if: steps.check.outputs.exists == 'false' && steps.src.outputs.app_changed == 'true'
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {"text": "⚠️ prod 승격 누락 — Backend `${{ github.sha }}` | dev 이미지 `dev-${{ steps.src.outputs.src_sha }}` 없음(feat 우회 or 만료) → prod 미반영 | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|로그>"}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # 계층화 skip ② 앱 변경 없음(ci/docs 머지) → 조용히 (알림 X)
+      - name: Skip notice (no app change)
+        if: steps.check.outputs.exists == 'false' && steps.src.outputs.app_changed == 'false'
+        run: echo "ℹ️ 앱 변경 없음(ci/docs 머지) — prod 승격 skip (정상)"
+
+      # ── 이하 dev 이미지 존재할 때만 승격 ──
+      - name: Install crane
+        if: steps.check.outputs.exists == 'true'
+        uses: imjasonh/setup-crane@59c71e96a00b28651f10369ba3359a6d730740a0  # v0.6
+
+      - name: Promote image (crane copy — 재빌드 X, 동일 digest)
+        if: steps.check.outputs.exists == 'true'
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          SRC_SHA: ${{ steps.src.outputs.src_sha }}    # 셸 직접 보간 금지(인젝션 방지)
+        run: |
+          crane copy \
+            "$REGISTRY/farmily-api-dev:dev-$SRC_SHA" \
+            "$REGISTRY/farmily-api:prod-$SRC_SHA"
+
+      - name: Generate GitHub App token
+        if: steps.check.outputs.exists == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: urbanworkteam
+          repositories: Infra
+
+      - name: Checkout Infra
+        if: steps.check.outputs.exists == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: urbanworkteam/Infra
+          token: ${{ steps.app-token.outputs.token }}
+          ref: main
+          path: infra
+
+      - name: Bump prod image tag (values-prod.yaml)
+        if: steps.check.outputs.exists == 'true'
+        env:
+          TAG: prod-${{ steps.src.outputs.src_sha }}
+        run: |
+          cd infra
+          yq -i '.app.image.tag = strenv(TAG)' gitops/charts/farmily-app/values-prod.yaml
+
+      # prod는 사람 머지 게이트 → 직접 push 대신 PR 생성
+      - name: Create PR (prod 승격)
+        if: steps.check.outputs.exists == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          path: infra
+          branch: auto/bump-farmily-api-prod-${{ steps.src.outputs.src_sha }}
+          commit-message: "chore(gitops): prod bump farmily-app to prod-${{ steps.src.outputs.src_sha }}"
+          title: "chore(gitops): prod bump farmily-app → prod-${{ steps.src.outputs.src_sha }}"
+          body: |
+            **Auto-generated by Backend CI (build-once)**
+            - 승격: `farmily-api-dev:dev-${{ steps.src.outputs.src_sha }}` → `farmily-api:prod-${{ steps.src.outputs.src_sha }}` (crane copy, 동일 digest)
+            - Backend commit: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+            - 머지하면 ArgoCD가 prod-eks에 반영.
+          labels: gitops,auto-bump
+
+  # ─── Job 3b: ECS 배포 (prod, AI 고도화 지원) ─── main push만
+  # EKS가 primary(weight 100%)이지만, AI 담당이 ECS 환경에서 고도화 작업 중이므로
+  # Backend 변경을 ECS에도 자동 반영. build-once: gitops-update-prod가 crane copy한
+  # farmily-api:prod-<sha>를 그대로 사용(재빌드 X). HTTP weight 0이라 사용자 영향 0.
+  # 고도화 완료 후 ECS 내리면 이 job 제거.
+  deploy-ecs-prod:
+    needs: [ci, gitops-update-prod]
+    if: github.ref_name == 'main' && needs.gitops-update-prod.outputs.promoted == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition prod-app \
+            --query taskDefinition \
+            --output json > task-def.json
+
+      - name: Render new task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@6853cfae8c3a7d978fbf68b5a55453395541dfbb  # v1.8.5
+        with:
+          task-definition: task-def.json
+          container-name: prod-app
+          image: 851957594139.dkr.ecr.ap-northeast-2.amazonaws.com/farmily-api:prod-${{ needs.gitops-update-prod.outputs.src_sha }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@a310a830f5c14e583e35d84e4e1ec7dd177c3c9c  # v2.6.2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: prod-app-service
+          cluster: prod-cluster
+          wait-for-service-stability: true
+
+  # ─── Job 4: GitOps 이미지 태그 bump (dev) ─── feat push만
+  # ArgoCD(pull-CD)가 main을 보고 당겨감. 클러스터 직접 안 건드림, AWS 권한 0.
+  # dev ECS 경로는 EKS 일원화로 제거(결정 B). dev ECS 실자원 정리는 후속 작업.
+  gitops-update-dev:
+    needs: push-image
+    if: github.ref_name == 'feat'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read       # GITHUB_TOKEN 미사용(App 토큰으로 push) → 최소권한
+    concurrency:
+      group: gitops-update-dev   # 동시 feat 푸시 직렬화(non-fast-forward 방지)
+      cancel-in-progress: false
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: urbanworkteam
+          repositories: Infra        # 토큰 스코프를 Infra 레포로 한정
+
+      - name: Checkout Infra
+        uses: actions/checkout@v4
+        with:
+          repository: urbanworkteam/Infra
+          token: ${{ steps.app-token.outputs.token }}
+          ref: main                  # ArgoCD dev 앱 targetRevision
+          path: infra
+
+      - name: Bump image tag (values-dev.yaml)
+        env:
+          TAG: ${{ needs.push-image.outputs.tag }}
+        run: |
+          cd infra
+          yq -i '.app.image.tag = strenv(TAG)' gitops/charts/farmily-app/values-dev.yaml
+
+      - name: Commit & push
+        env:
+          TAG: ${{ needs.push-image.outputs.tag }}
+        run: |
+          cd infra
+          git config user.name  "farmily-gitops-bot[bot]"
+          git config user.email "farmily-gitops-bot[bot]@users.noreply.github.com"
+          git add gitops/charts/farmily-app/values-dev.yaml
+          # 태그가 동일하면(재실행 등) 빈 커밋 방지하고 정상 종료
+          git diff --cached --quiet && { echo "변경 없음 — skip"; exit 0; }
+          git commit -m "chore(dev): bump farmily-app image to ${TAG} [skip ci]"
+          # 레이스 대비: 푸시 거부되면 rebase 후 1회 재시도
+          git push || { git pull --rebase && git push; }
