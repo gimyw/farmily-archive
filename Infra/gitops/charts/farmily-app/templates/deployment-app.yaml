@@ -1,0 +1,76 @@
+# farmily-app 워크로드 — canary.enabled(prod)=Rollout / 아니면(dev)=Deployment.
+# 두 종류는 apiVersion·kind + 맨 끝 strategy 블록만 다르고 파드 spec(template)은 동일 → 한 파일로 관리.
+apiVersion: {{ if .Values.canary.enabled }}argoproj.io/v1alpha1{{ else }}apps/v1{{ end }}
+kind: {{ if .Values.canary.enabled }}Rollout{{ else }}Deployment{{ end }}
+metadata:
+  name: {{ .Values.app.name }}
+  namespace: {{ .Values.namespace }}
+spec:
+  replicas: {{ .Values.app.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.app.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.app.name }}
+      {{- if .Values.appSignals }}
+      annotations:
+        # CloudWatch Application Signals — 오퍼레이터가 ADOT 자바에이전트를 런타임 주입(이미지 무수정).
+        instrumentation.opentelemetry.io/inject-java: "true"
+      {{- end }}
+    spec:
+      serviceAccountName: {{ .Values.app.name }}
+      containers:
+        - name: {{ .Values.app.name }}
+          image: {{ .Values.app.image.repository }}:{{ .Values.app.image.tag }}
+          ports:
+            - containerPort: {{ .Values.app.port }}
+          {{- with .Values.app.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            {{- toYaml .Values.app.env | nindent 12 }}
+          envFrom:
+            - secretRef:
+                name: app-secrets       # ESO 가 병합 생성
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.app.health }}
+              port: {{ .Values.app.port }}
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.app.health }}
+              port: {{ .Values.app.port }}
+            initialDelaySeconds: 90
+            periodSeconds: 15
+  {{- if .Values.canary.enabled }}
+  # ── 카나리 전략 (Rollout 전용) ──────────────────────────────
+  # Rollouts 컨트롤러가 아래 step 에 따라 farmily-app-vsvc 의 stable:canary weight 를 자동 조정.
+  strategy:
+    canary:
+      trafficRouting:
+        istio:
+          virtualService:
+            name: {{ .Values.app.name }}-vsvc
+            routes: [primary]
+          destinationRule:
+            name: {{ .Values.app.name }}-dr
+            canarySubsetName: canary
+            stableSubsetName: stable
+      steps:
+        - setWeight: 10            # 10% 카나리
+        - pause: { duration: 2m }  # 2분 관찰
+        - analysis:                # Prometheus 에러율 게이트(실패 시 자동 롤백)
+            templates:
+              - templateName: success-rate
+        - setWeight: 50            # 50% 확장
+        - pause: { duration: 2m }
+        - analysis:
+            templates:
+              - templateName: success-rate
+        # 통과 시 자동 100%
+  {{- end }}

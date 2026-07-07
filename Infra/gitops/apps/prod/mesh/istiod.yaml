@@ -1,0 +1,39 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: istiod
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: https://istio-release.storage.googleapis.com/charts
+    chart: istiod
+    targetRevision: 1.30.1
+    helm:
+      values: |
+        meshConfig:
+          enableTracing: true
+          extensionProviders:
+            - name: jaeger-otel
+              opentelemetry:
+                service: jaeger-otlp.istio-system.svc.cluster.local   # jaeger svc 확인값
+                port: 4317                                                  # OTLP gRPC
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: istio-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+  # istiod가 istio-validator webhook의 failurePolicy를 런타임에 Fail↔Ignore로 동적 관리 →
+  # 차트(Fail)와 클러스터(Ignore)가 어긋나 영구 OutOfSync. 해당 필드 diff만 무시.
+  ignoreDifferences:
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      name: istio-validator-istio-system
+      jqPathExpressions:
+        - '.webhooks[].failurePolicy'

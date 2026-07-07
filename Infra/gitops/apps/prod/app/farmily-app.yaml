@@ -1,0 +1,25 @@
+# farmily-app Helm 차트를 prod values 로 배포 (app-of-apps: root-prod 가 이 Application 을 동기화)
+# prod = app + AI(AgentCore) + HPA + KEDA 전부 (values-prod.yaml 의 enabled 플래그로 켜짐)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: farmily-app-prod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/urbanworkteam/Infra.git
+    targetRevision: main
+    path: gitops/charts/farmily-app
+    helm:
+      valueFiles:
+        - values-prod.yaml       # 차트 디렉터리 기준 상대경로
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: farmily-prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

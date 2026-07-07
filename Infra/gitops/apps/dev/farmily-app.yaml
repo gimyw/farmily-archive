@@ -1,0 +1,24 @@
+# farmily-app Helm 차트를 dev values 로 배포 (app-of-apps: root-dev 가 이 Application 을 동기화)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: farmily-app-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/urbanworkteam/Infra.git
+    targetRevision: main
+    path: gitops/charts/farmily-app
+    helm:
+      valueFiles:
+        - values-dev.yaml        # 차트 디렉터리 기준 상대경로
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: farmily-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

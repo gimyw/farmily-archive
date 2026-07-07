@@ -1,0 +1,81 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 86.3.2
+    helm:
+      values: |
+        grafana:
+          enabled: true
+        prometheus:
+          # AMP remote-write 시 SigV4 서명에 쓸 IRSA 역할을 Prometheus 파드 SA에 연결.
+          # SA명은 차트 기본값(kube-prometheus-stack-prometheus) 유지 → 어노테이션만 추가.
+          # amp.tf 신뢰정책의 sub(system:serviceaccount:monitoring:kube-prometheus-stack-prometheus)와 정확히 일치해야 AssumeRole 성공.
+          serviceAccount:
+            create: true
+            annotations:
+              eks.amazonaws.com/role-arn: arn:aws:iam::851957594139:role/prod-eks-amp-write-role
+          prometheusSpec:
+            # 메트릭 보관 기간. 15일치 보관 후 자동 삭제 (로컬 TSDB)
+            retention: 15d
+            # 클러스터 밖 AMP로 송신 → 서울 리전 장애에도 도쿄 AMG에서 cross-region 조회 가능.
+            # sigv4에 accessKey/roleArn 미지정 → 기본 자격증명 체인이 위 SA의 IRSA 웹아이덴티티 토큰을 사용해 서명.
+            remoteWrite:
+              - url: https://aps-workspaces.ap-northeast-2.amazonaws.com/workspaces/ws-2f69639a-b9ad-4401-bdf1-b5914847b3e2/api/v1/remote_write
+                sigv4:
+                  region: ap-northeast-2
+                # 송신 큐 튜닝 — 일시적 부하·네트워크 지연 시 샘플 유실 방지(소규모 클러스터 보수값)
+                queueConfig:
+                  capacity: 2500
+                  maxSamplesPerSend: 1000
+                  maxShards: 200
+                # === AMP 인입비 절감: 고카디널리티·미사용 메트릭을 AMP 송신 직전에 제거 ===
+                # writeRelabelConfigs는 remote_write 경로에서만 동작 → 로컬 TSDB(15d)와
+                # 인클러스터 알람(로컬 평가)엔 영향 없음. AMG(cross-region 조회)에서 해당 패널만 사라짐.
+                # 보존: apiserver_request_duration/sli_duration_bucket·apiserver_request_total (SLO 레코딩룰 입력)
+                # 예상: 활성 시계열 163K → ~91K (-44%), 인입비 ~$600→~$340/월
+                writeRelabelConfigs:
+                  # apiserver verbose 히스토그램 (latency/total 핵심 지표는 제외하고 나머지만 drop)
+                  - sourceLabels: [__name__]
+                    action: drop
+                    regex: 'apiserver_(request_body_size_bytes|response_sizes|watch_list_duration_seconds|watch_cache_read_wait_seconds|storage_list_duration_seconds|watch_events_sizes|admission_controller_admission_duration_seconds|admission_webhook_admission_duration_seconds|flowcontrol_request_execution_seconds|flowcontrol_priority_level_request_utilization|flowcontrol_request_wait_duration_seconds)_bucket'
+                  - sourceLabels: [__name__]
+                    action: drop
+                    regex: 'apiserver_request_body_size_bytes_(sum|count)'
+                  # etcd 클라이언트 히스토그램 (EKS 관리형 etcd → 대시보드 미사용)
+                  - sourceLabels: [__name__]
+                    action: drop
+                    regex: 'etcd_request_duration_seconds_bucket'
+                  # controller-runtime / workqueue / rest·client-go / storage / prober 내부 히스토그램
+                  - sourceLabels: [__name__]
+                    action: drop
+                    regex: '(controller_runtime_reconcile_time_seconds|workqueue_queue_duration_seconds|workqueue_work_duration_seconds|rest_client_request_duration_seconds|rest_client_request_size_bytes|rest_client_response_size_bytes|client_go_request_duration_seconds|storage_operation_duration_seconds|prober_probe_duration_seconds)_bucket'
+                  # kubelet / aws-sdk-go 내부 호출 히스토그램
+                  - sourceLabels: [__name__]
+                    action: drop
+                    regex: '(kubelet_runtime_operations_duration_seconds|kubelet_http_requests_duration_seconds|aws_sdk_go_request_duration_seconds|aws_sdk_go_request_attempt_duration_seconds|aws_sdk_go_request_retry_count)_bucket'
+                  # karpenter 인스턴스 카탈로그 (타입×AZ×capacity 폭발, AMG 거의 미조회)
+                  - sourceLabels: [__name__]
+                    action: drop
+                    regex: 'karpenter_cloudprovider_instance_type_offering_(available|price_estimate)'
+        alertmanager:
+          enabled: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # 거대 CRD(prometheuses 등)의 last-applied-configuration이 262144B 한계를 넘어 sync 실패 → 서버사이드 어플라이로 회피
+      - ServerSideApply=true
+      # CRD가 같은 차트에서 늦게 깔릴 때 CR dry-run으로 전체 sync 막히지 않게
+      - SkipDryRunOnMissingResource=true
