@@ -3,7 +3,7 @@ agent.py  —  Farmily AgentCore 메인 엔트리포인트
 
 아키텍처:
   [클라이언트]
-      └→ AgentCore Runtime (ECS 컨테이너)
+      └→ ECS Fargate 컨테이너 (BedrockAgentCoreApp HTTP 하니스, :8080)
            └→ Strands Agent  (apac.claude-3-5-sonnet-v2)
                 ├→ @tool get_diary
                 ├→ @tool get_crop_info

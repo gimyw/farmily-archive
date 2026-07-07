@@ -8,16 +8,18 @@
 
 ```
 [Spring Boot 백엔드]
-    └→ BedrockAgentCore Runtime (ECS Fargate, port 8080)
+    └→ ECS Fargate 컨테이너 (BedrockAgentCoreApp HTTP 하니스, port 8080)
          └→ Strands Agent (claude-3-5-sonnet-v2 APAC)
               ├→ @tool get_diary            # 영농일지 조회
               ├→ @tool get_crop_info        # 작물 정보 조회
               ├→ @tool search_recipe        # 레시피 검색
               ├→ @tool search_local_specialty  # 지역 특산물 검색
               ├→ @tool get_content_history  # 콘텐츠 히스토리 조회
-              └→ @tool search_trend         # 트렌드 검색
+              └→ @tool search_trend         # 트렌드 하이브리드 검색 (pg_trgm + pgvector)
                    └→ farmily-card-renderer (Lambda) # 카드 이미지 생성
 ```
+
+> 컨테이너는 `bedrock_agentcore` SDK의 `BedrockAgentCoreApp` 으로 표준 호출 인터페이스(`/invocations`, :8080)를 노출하며, **ECS Fargate** 에서 실행된다. 에이전트 루프는 Strands Agents SDK로 직접 구현한다.
 
 ---
 
@@ -50,7 +52,7 @@ farmily-agentcore/
 
 ## 주요 흐름
 
-1. Spring Boot가 `BedrockAgentClient.invoke()` 로 AgentCore 호출
+1. Spring Boot가 `BedrockAgentClient.invoke()` 로 에이전트 컨테이너의 `/invocations` 엔드포인트 호출
 2. `handler()` 에서 DB 컨텍스트 조회 후 Strands Agent 실행
 3. Agent가 @tool 함수들을 호출해 데이터 수집
 4. Claude가 JSON 형식의 콘텐츠(caption, hashtags, textPool) 생성
@@ -87,7 +89,7 @@ farmily-agentcore/
 
 ## 인프라
 
-- **런타임**: AWS BedrockAgentCore (ECS Fargate, `prod-cluster`)
+- **런타임**: ECS Fargate (`prod-cluster`) — `BedrockAgentCoreApp` 하니스로 패키징한 Strands 에이전트 컨테이너
 - **서비스 디스커버리**: Cloud Map (`farmily-agentcore.farmily.local`)
 - **로그**: CloudWatch Logs `/ecs/farmily-agentcore`
 - **모니터링**: CloudWatch 커스텀 메트릭 `Farmily/AgentCore` 네임스페이스
