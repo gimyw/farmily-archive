@@ -1,4 +1,4 @@
-# Farmily AgentCore
+# Farmily AI
 
 농부 소셜 미디어 콘텐츠 자동 생성 AI 에이전트. 영농일지 데이터를 기반으로 인스타그램 캡션, 해시태그, 카드 이미지용 텍스트를 생성합니다.
 
@@ -9,16 +9,21 @@
 ```
 [Spring Boot 백엔드]
     └→ ECS Fargate 컨테이너 (BedrockAgentCoreApp HTTP 하니스, port 8080)
-         └→ Strands Agent (claude-3-5-sonnet-v2 APAC)
-              ├→ @tool get_diary            # 영농일지 조회
-              ├→ @tool get_crop_info        # 작물 정보 조회
-              ├→ @tool search_recipe        # 레시피 검색
-              ├→ @tool search_local_specialty  # 지역 특산물 검색
-              ├→ @tool get_content_history  # 콘텐츠 히스토리 조회
-              └→ @tool search_trend         # 트렌드 하이브리드 검색 (pg_trgm + pgvector)
-                   └→ farmily-card-renderer (Lambda) # 카드 이미지 생성
+         │
+         ├─ ① prefetch — 핸들러에서 병렬 사전조회 (LLM 왕복 없음)
+         │     ├→ get_diary            # 영농일지 조회
+         │     ├→ get_crop_info        # 작물 정보 조회
+         │     ├→ get_content_history  # 콘텐츠 이력 (각도 비율 계산용)
+         │     └→ search_trend         # 트렌드 하이브리드 검색 (pg_trgm + pgvector)
+         │
+         └─ ② Strands Agent (claude-3-5-sonnet-v2 APAC) — 각도 결정 후 조건부 도구만 호출
+               ├→ @tool search_recipe          # 레시피 검색 (각도=레시피)
+               └→ @tool search_local_specialty # 지역 특산물 (각도=스토리텔링/지역강조)
+                     └→ farmily-card-renderer (Lambda) # 카드 이미지 생성
 ```
 
+> 6개 도구 함수는 모두 `@tool` 로 정의돼 있으나, **항상 필요한 결정적 조회 4개**(get_diary·get_crop_info·get_content_history·search_trend)는 LLM에 노출하지 않고 핸들러에서 `ThreadPoolExecutor` 로 **병렬 사전조회(prefetch)** 해 왕복을 제거한다. **각도에 따라 갈리는 조건부 검색 2개**(search_recipe·search_local_specialty)만 `_TOOLS` 로 에이전트에 넘겨 LLM이 자율 호출한다.
+>
 > 컨테이너는 `bedrock_agentcore` SDK의 `BedrockAgentCoreApp` 으로 표준 호출 인터페이스(`/invocations`, :8080)를 노출하며, **ECS Fargate** 에서 실행된다. 에이전트 루프는 Strands Agents SDK로 직접 구현한다.
 
 ---
@@ -28,7 +33,7 @@
 ```
 farmily-agentcore/
 ├── agent.py              # 메인 엔트리포인트 (@app.entrypoint)
-├── tools.py              # Strands @tool 함수 6개
+├── tools.py              # @tool 함수 6개 (prefetch 4 + LLM 노출 2)
 ├── farmily_utils.py      # DB 연결 등 공통 유틸
 ├── prompts/
 │   ├── base_instruction.txt      # System Prompt 기본 지침
@@ -53,8 +58,8 @@ farmily-agentcore/
 ## 주요 흐름
 
 1. Spring Boot가 `BedrockAgentClient.invoke()` 로 에이전트 컨테이너의 `/invocations` 엔드포인트 호출
-2. `handler()` 에서 DB 컨텍스트 조회 후 Strands Agent 실행
-3. Agent가 @tool 함수들을 호출해 데이터 수집
+2. `handler()` 에서 DB 컨텍스트 조회 + 결정적 도구 4개를 병렬 prefetch
+3. prefetch 결과를 주입해 Strands Agent 실행 → 각도 결정 후 조건부 도구(레시피/지역)만 호출
 4. Claude가 JSON 형식의 콘텐츠(caption, hashtags, textPool) 생성
 5. `farmily-card-renderer` Lambda 호출 → 카드 이미지 S3 저장
 6. DB에 결과 저장 후 `DONE(100%)` 상태 업데이트
