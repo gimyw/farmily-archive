@@ -5,6 +5,10 @@ on:
     branches: [main]
   push:
     branches: [main]
+    # 문서 전용 변경(마크다운/docs)은 이미지 재빌드·ECS 재배포를 트리거하지 않는다.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
 
 permissions:
   id-token: write
